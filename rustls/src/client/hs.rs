@@ -474,8 +474,11 @@ where
             .cloned(),
     );
 
+    // After the encrypted client hello rather than before it: that is where
+    // browsers put their trailing GREASE, and the two extensions being the
+    // other way round is a difference that costs nothing to avoid.
     if let Some(grease) = input.hello.grease {
-        exts.appended_extensions
+        exts.final_extensions
             .push(RawExtension {
                 typ: grease.last_extension,
                 payload: Grease::LAST_EXTENSION_PAYLOAD.to_vec(),
@@ -544,7 +547,7 @@ where
         if let Some(body_len) = padding.body_len(measured.len()) {
             chp_payload
                 .extensions
-                .appended_extensions
+                .final_extensions
                 .push(RawExtension::padding(body_len));
         }
     }

@@ -998,6 +998,14 @@ extension_struct! {
         /// Verbatim extensions written after everything rustls generates,
         /// but ahead of ECH and PSK - those two are required to be last.
         pub(crate) appended_extensions: Vec<RawExtension>,
+
+        /// Verbatim extensions written after the encrypted client hello and
+        /// before the pre-shared key offer.
+        ///
+        /// Only the PSK offer is pinned to the very end by the standard, and
+        /// browsers use the room after ECH: their trailing GREASE sits there,
+        /// and the padding that follows it.
+        pub(crate) final_extensions: Vec<RawExtension>,
     }
 }
 
@@ -1031,6 +1039,7 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             prepended_extensions,
             appended_extensions,
+            final_extensions,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1060,12 +1069,14 @@ impl ClientExtensions<'_> {
             contiguous_extensions,
             prepended_extensions,
             appended_extensions,
+            final_extensions,
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
         let mut exts = self.body_extensions_in_encoding_order();
-        exts.extend(self.trailing_extensions());
+        exts.extend(self.ech_extensions());
+        exts.extend(self.preshared_key_extension());
         exts
     }
 
@@ -1079,9 +1090,9 @@ impl ClientExtensions<'_> {
         exts
     }
 
-    /// Extensions the standard requires to come last, in that order.
-    fn trailing_extensions(&self) -> Vec<ExtensionType> {
-        let mut exts = Vec::with_capacity(3);
+    /// The encrypted client hello extensions, in the order they are written.
+    fn ech_extensions(&self) -> Vec<ExtensionType> {
+        let mut exts = Vec::with_capacity(2);
         if self
             .encrypted_client_hello_outer
             .is_some()
@@ -1091,10 +1102,14 @@ impl ClientExtensions<'_> {
         if self.encrypted_client_hello.is_some() {
             exts.push(ExtensionType::EncryptedClientHello);
         }
-        if self.preshared_key_offer.is_some() {
-            exts.push(ExtensionType::PreSharedKey);
-        }
         exts
+    }
+
+    /// The pre-shared key offer, which the standard pins to the very end.
+    fn preshared_key_extension(&self) -> Option<ExtensionType> {
+        self.preshared_key_offer
+            .as_ref()
+            .map(|_| ExtensionType::PreSharedKey)
     }
 
     /// Every extension type this hello carries, verbatim ones included.
@@ -1108,6 +1123,7 @@ impl ClientExtensions<'_> {
             self.prepended_extensions
                 .iter()
                 .chain(self.appended_extensions.iter())
+                .chain(self.final_extensions.iter())
                 .map(|raw| ExtensionType::from(raw.typ)),
         );
         exts
@@ -1151,12 +1167,15 @@ impl ClientExtensions<'_> {
 impl<'a> Codec<'a> for ClientExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         let generated = self.body_extensions_in_encoding_order();
-        let trailing = self.trailing_extensions();
+        let ech = self.ech_extensions();
+        let preshared_key = self.preshared_key_extension();
 
         if generated.is_empty()
-            && trailing.is_empty()
+            && ech.is_empty()
+            && preshared_key.is_none()
             && self.prepended_extensions.is_empty()
             && self.appended_extensions.is_empty()
+            && self.final_extensions.is_empty()
         {
             return;
         }
@@ -1171,7 +1190,13 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
         for raw in &self.appended_extensions {
             raw.encode(body.buf);
         }
-        for item in trailing {
+        for item in ech {
+            self.encode_one(item, body.buf);
+        }
+        for raw in &self.final_extensions {
+            raw.encode(body.buf);
+        }
+        if let Some(item) = preshared_key {
             self.encode_one(item, body.buf);
         }
     }

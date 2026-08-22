@@ -1393,3 +1393,46 @@ fn grease_ech_refuses_a_kem_it_cannot_size() {
     };
     assert!(EchGreaseConfig::without_provider(suite).is_err());
 }
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn the_trailing_grease_extension_goes_after_ech() {
+    use crate::client::{ClientHelloProfile, EchGreaseConfig, EchMode};
+    use crate::crypto::hpke::HpkeSuite;
+    use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use crate::msgs::handshake::HpkeSymmetricCipherSuite;
+
+    #[cfg(feature = "ring")]
+    let provider = crate::crypto::ring::default_provider();
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = crate::crypto::aws_lc_rs::default_provider();
+
+    let mut config = ClientConfig::builder_with_provider(provider.into())
+        .with_ech(EchMode::Grease(
+            EchGreaseConfig::without_provider(HpkeSuite {
+                kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+                sym: HpkeSymmetricCipherSuite {
+                    kdf_id: HpkeKdf::HKDF_SHA256,
+                    aead_id: HpkeAead::AES_128_GCM,
+                },
+            })
+            .unwrap(),
+        ))
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+    config.client_hello_profile = Arc::new(ClientHelloProfile {
+        grease: true,
+        ..Default::default()
+    });
+
+    let hello = WireClientHello::capture(config);
+    let types = hello.extension_types();
+
+    // Browsers put their trailing GREASE after the encrypted client hello,
+    // not before it. Only the pre-shared key offer is pinned to the very end
+    // by the standard, so there is room there and no reason to differ.
+    let last_two = &types[types.len() - 2..];
+    assert_eq!(last_two[0], 0xfe0d, "extensions: {types:04x?}");
+    assert!(is_grease(last_two[1]), "extensions: {types:04x?}");
+}
