@@ -7,7 +7,7 @@ use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
 use crate::sync::Arc;
-use crate::{SignatureScheme, compress, sign};
+use crate::{CipherSuite, SignatureScheme, compress, sign};
 
 #[derive(Debug)]
 pub(super) struct ServerCertDetails<'a> {
@@ -48,6 +48,7 @@ pub(super) struct ClientHelloDetails {
     /// another in the second has been handed a distinguishing feature for
     /// free.
     pub(super) grease: Option<Grease>,
+    pub(super) offered_cipher_suites: Vec<CipherSuite>,
 }
 
 impl ClientHelloDetails {
@@ -62,6 +63,7 @@ impl ClientHelloDetails {
             extension_order_seed,
             offered_cert_compression: false,
             grease,
+            offered_cipher_suites: Vec::new(),
         }
     }
 

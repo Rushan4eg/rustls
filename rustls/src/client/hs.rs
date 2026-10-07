@@ -33,9 +33,9 @@ use crate::msgs::codec::Codec;
 use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
-    ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
-    HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random, RawExtension,
-    ServerNamePayload, SessionId, SupportedEcPointFormats, SupportedProtocolVersions,
+    ClientSessionTicket, ClientTicketRequest, EncryptedClientHello, HandshakeMessagePayload,
+    HandshakePayload, HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random,
+    RawExtension, ServerNamePayload, SessionId, SupportedEcPointFormats, SupportedProtocolVersions,
     TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
@@ -58,117 +58,10 @@ pub(super) fn start_handshake<T>(
 where
     T: Fn(&[u8]) -> [u8; 32],
 {
-    let mut transcript_buffer = HandshakeHashBuffer::new();
-    if config
-        .client_auth_cert_resolver
-        .has_certs()
-    {
-        transcript_buffer.set_client_auth_enabled();
-    }
-
-    let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
-
-    // Initialize Reality state if configured
-    let reality_state = config
-        .reality_config
-        .as_ref()
-        .map(|reality_config| {
-            reality::RealitySessionState::new(Arc::clone(reality_config), &config.provider)
-        })
-        .transpose()?;
-
-    // For Reality, use Reality's X25519 key exchange; otherwise use normal TLS
-    let key_share = if reality_state.is_some() {
-        // Reality provides its own key exchange (X25519)
-        let x25519_group = config
-            .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
-            .ok_or(Error::General("X25519 group required for Reality".into()))?;
-        cx.common.kx_state = KxState::Start(x25519_group);
-        None // Will be set later from reality_state
-    } else if config.supports_version(ProtocolVersion::TLSv1_3) {
-        Some(tls13::initial_key_share(
-            &config,
-            &server_name,
-            &mut cx.common.kx_state,
-        )?)
-    } else {
-        None
-    };
-
-    let session_id = match &mut resuming {
-        Some(_resuming) => {
-            debug!("Resuming session");
-            match &mut _resuming.value {
-                #[cfg(feature = "tls12")]
-                ClientSessionValue::Tls12(inner) => {
-                    // If we have a ticket, we use the sessionid as a signal that
-                    // we're doing an abbreviated handshake.  See section 3.4 in
-                    // RFC5077.
-                    if !inner.ticket().0.is_empty() {
-                        inner.session_id = SessionId::random(config.provider.secure_random)?;
-                    }
-                    Some(inner.session_id)
-                }
-                _ => None,
-            }
-        }
-        _ => {
-            debug!("Not resuming any session");
-            None
-        }
-    };
-
-    // https://tools.ietf.org/html/rfc8446#appendix-D.4
-    // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
-    let session_id = match session_id {
-        Some(session_id) => session_id,
-        None if cx.common.is_quic() => SessionId::empty(),
-        None if !config.supports_version(ProtocolVersion::TLSv1_3) => SessionId::empty(),
-        None => SessionId::random(config.provider.secure_random)?,
-    };
-
-    let random = Random::new(config.provider.secure_random)?;
-    let extension_order_seed = crate::rand::random_u16(config.provider.secure_random)?;
-
-    let grease = match config.client_hello_profile.grease {
-        true => Some(Grease::new(config.provider.secure_random)?),
-        false => None,
-    };
-
-    let hello = ClientHelloDetails::new(
-        extra_exts
-            .protocols
-            .clone()
-            .unwrap_or_default(),
-        extension_order_seed,
-        grease,
-    );
-
-    let ech_state = match config.ech_mode.as_ref() {
-        Some(EchMode::Enable(ech_config)) => Some(ech_config.state(server_name.clone(), &config)?),
-        _ => None,
-    };
-
-    emit_client_hello_for_retry(
-        transcript_buffer,
-        None,
-        key_share,
+    ClientHelloInput::new(server_name, &extra_exts, cx, config)?.start_handshake(
         extra_exts,
-        None,
-        session_id_generator,
-        ClientHelloInput {
-            config,
-            resuming,
-            random,
-            sent_tls13_fake_ccs: false,
-            hello,
-            session_id,
-            server_name,
-            prev_ech_ext: None,
-        },
         cx,
-        ech_state,
-        reality_state,
+        session_id_generator,
     )
 }
 
@@ -203,6 +96,140 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+}
+
+impl ClientHelloInput {
+    pub(super) fn new(
+        server_name: ServerName<'static>,
+        extra_exts: &ClientExtensionsInput<'_>,
+        cx: &mut ClientContext<'_>,
+        config: Arc<ClientConfig>,
+    ) -> Result<Self, Error> {
+        let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
+        let session_id = match &mut resuming {
+            Some(_resuming) => {
+                debug!("Resuming session");
+                match &mut _resuming.value {
+                    #[cfg(feature = "tls12")]
+                    ClientSessionValue::Tls12(inner) => {
+                        // If we have a ticket, we use the sessionid as a signal that
+                        // we're  doing an abbreviated handshake.  See section 3.4 in
+                        // RFC5077.
+                        if !inner.ticket().0.is_empty() {
+                            inner.session_id = SessionId::random(config.provider.secure_random)?;
+                        }
+                        Some(inner.session_id)
+                    }
+                    _ => None,
+                }
+            }
+            _ => {
+                debug!("Not resuming any session");
+                None
+            }
+        };
+
+        // https://tools.ietf.org/html/rfc8446#appendix-D.4
+        // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None if cx.common.is_quic() => SessionId::empty(),
+            None if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) => {
+                SessionId::empty()
+            }
+            None => SessionId::random(config.provider.secure_random)?,
+        };
+
+        let grease = match config.client_hello_profile.grease {
+            true => Some(Grease::new(config.provider.secure_random)?),
+            false => None,
+        };
+        let hello = ClientHelloDetails::new(
+            extra_exts
+                .protocols
+                .clone()
+                .unwrap_or_default(),
+            crate::rand::random_u16(config.provider.secure_random)?,
+            grease,
+        );
+
+        Ok(Self {
+            resuming,
+            random: Random::new(config.provider.secure_random)?,
+            sent_tls13_fake_ccs: false,
+            hello,
+            session_id,
+            server_name,
+            prev_ech_ext: None,
+            config,
+        })
+    }
+
+    pub(super) fn start_handshake<T>(
+        self,
+        extra_exts: ClientExtensionsInput<'static>,
+        cx: &mut ClientContext<'_>,
+        session_id_generator: Option<T>,
+    ) -> NextStateOrError<'static>
+    where
+        T: Fn(&[u8]) -> [u8; 32],
+    {
+        let mut transcript_buffer = HandshakeHashBuffer::new();
+        if self
+            .config
+            .client_auth_cert_resolver
+            .has_certs()
+        {
+            transcript_buffer.set_client_auth_enabled();
+        }
+
+        let reality_state = self
+            .config
+            .reality_config
+            .as_ref()
+            .map(|reality_config| {
+                reality::RealitySessionState::new(Arc::clone(reality_config), &self.config.provider)
+            })
+            .transpose()?;
+
+        let key_share = if reality_state.is_some() {
+            // Reality authenticates its own X25519 share in the session ID.
+            let x25519_group = self
+                .config
+                .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+                .ok_or(Error::General("X25519 group required for Reality".into()))?;
+            cx.common.kx_state = KxState::Start(x25519_group);
+            None
+        } else if self.config.needs_key_share() {
+            Some(tls13::initial_key_share(
+                &self.config,
+                &self.server_name,
+                &mut cx.common.kx_state,
+            )?)
+        } else {
+            None
+        };
+
+        let ech_state = match self.config.ech_mode.as_ref() {
+            Some(EchMode::Enable(ech_config)) => {
+                Some(ech_config.state(self.server_name.clone(), &self.config)?)
+            }
+            _ => None,
+        };
+
+        emit_client_hello_for_retry(
+            transcript_buffer,
+            None,
+            key_share,
+            extra_exts,
+            None,
+            session_id_generator,
+            self,
+            cx,
+            ech_state,
+            reality_state,
+        )
+    }
 }
 
 /// Emits the initial ClientHello or a ClientHello in response to
@@ -241,8 +268,9 @@ where
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
 
     let mut supported_versions = SupportedProtocolVersions {
-        tls12: config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12,
-        tls13: config.supports_version(ProtocolVersion::TLSv1_3),
+        tls12: config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
+            && !forbids_tls12,
+        tls13: config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol),
         grease: None,
     };
 
@@ -271,6 +299,17 @@ where
         protocols: extra_exts.protocols.clone(),
         ..Default::default()
     });
+
+    if !config
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .any(|cs| cs.tls13().is_some())
+    {
+        if let Some(schemes) = &mut exts.signature_schemes {
+            schemes.retain(|scheme| scheme.algorithm().is_some());
+        }
+    }
 
     match extra_exts.transport_parameters.clone() {
         Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
@@ -355,6 +394,13 @@ where
             psk: false,
             psk_dhe: true,
         });
+
+        if let Some(ticket_req) = &config.send_ticket_request {
+            exts.ticket_request = Some(ClientTicketRequest {
+                new_session_count: ticket_req.new_session_count,
+                resumption_count: ticket_req.resumption_count,
+            });
+        }
     }
 
     input.hello.offered_cert_compression =
@@ -554,6 +600,7 @@ where
 
     // Note what extensions we sent.
     input.hello.sent_extensions = chp_payload.all_sent_extensions();
+    input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
 
@@ -748,7 +795,7 @@ fn prepare_resumption<'a>(
     let resuming = match resuming {
         Some(resuming) if !resuming.ticket().is_empty() => resuming,
         _ => {
-            if config.supports_version(ProtocolVersion::TLSv1_2)
+            if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
                 && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
             {
                 // If we don't have a ticket, request one.
@@ -760,7 +807,7 @@ fn prepare_resumption<'a>(
 
     let Some(tls13) = resuming.map(|csv| csv.tls13()) else {
         // TLS 1.2; send the ticket if we have support this protocol version
-        if config.supports_version(ProtocolVersion::TLSv1_2)
+        if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
             && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
         {
             exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
@@ -768,7 +815,7 @@ fn prepare_resumption<'a>(
         return None; // TLS 1.2, so nothing to return here
     };
 
-    if !config.supports_version(ProtocolVersion::TLSv1_3) {
+    if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) {
         return None;
     }
 
@@ -874,7 +921,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
         let config = &self.input.config;
-        let tls13_supported = config.supports_version(TLSv1_3);
+        let tls13_supported = config.supports_version(TLSv1_3, cx.common.protocol);
 
         let server_version = if server_hello.legacy_version == TLSv1_2 {
             server_hello
@@ -886,7 +933,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         let version = match server_version {
             TLSv1_3 if tls13_supported => TLSv1_3,
-            TLSv1_2 if config.supports_version(TLSv1_2) => {
+            TLSv1_2 if config.supports_version(TLSv1_2, cx.common.protocol) => {
                 if cx.data.early_data.is_enabled() && cx.common.early_traffic {
                     // The client must fail with a dedicated error code if the server
                     // responds with TLS 1.2 when offering 0-RTT.
@@ -962,14 +1009,18 @@ impl State<ClientConnectionData> for ExpectServerHello {
             }
         }
 
-        let suite = config
-            .find_cipher_suite(server_hello.cipher_suite)
-            .ok_or_else(|| {
-                cx.common.send_fatal_alert(
-                    AlertDescription::HandshakeFailure,
-                    PeerMisbehaved::SelectedUnofferedCipherSuite,
-                )
-            })?;
+        let Some(Some(suite)) = self
+            .input
+            .hello
+            .offered_cipher_suites
+            .contains(&server_hello.cipher_suite)
+            .then(|| config.find_cipher_suite(server_hello.cipher_suite, cx.common.protocol))
+        else {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::HandshakeFailure,
+                PeerMisbehaved::SelectedUnofferedCipherSuite,
+            ));
+        };
 
         if version != suite.version().version {
             return Err({
@@ -1140,7 +1191,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         // Or asks us to use a ciphersuite we didn't offer.
-        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
+        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite, cx.common.protocol) else {
             return Err({
                 cx.common.send_fatal_alert(
                     AlertDescription::IllegalParameter,

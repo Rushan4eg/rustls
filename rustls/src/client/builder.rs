@@ -231,6 +231,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             ech_mode: self.state.client_ech_mode,
             reality_config: self.state.reality_config,
             client_hello_profile: Arc::new(ClientHelloProfile::default()),
+            send_ticket_request: None,
         }
     }
 }
