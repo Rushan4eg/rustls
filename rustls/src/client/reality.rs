@@ -20,9 +20,11 @@
 //! 6. Result (ciphertext + tag = 32 bytes) becomes the session_id
 //!
 //! ## 2. TLS Key Exchange (standard TLS 1.3 ECDHE)
-//! 7. Client's public key (client_public) is sent in the ClientHello key_share extension
+//! 7. Client's public key (client_public) is sent in the ClientHello key_share extension,
+//!    twice: alone as X25519, and as the X25519 half of an X25519MLKEM768 share
 //! 8. Server responds with ServerHello containing its ephemeral public key
 //! 9. Client performs ECDH with server's **ephemeral public key**: tls_shared_secret = ECDH(client_private, server_hello_public_key)
+//!    (for X25519MLKEM768 the ML-KEM-768 secret goes in front of it)
 //! 10. tls_shared_secret is used for the TLS 1.3 key schedule (handshake and application traffic keys)
 //!
 //! **Key Point**: The same client_private is used for both ECDH operations, but with different
@@ -30,16 +32,27 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
+
+use ml_kem::{Decapsulate, KeyExport, MlKem768};
 
 use crate::crypto::tls13::Hkdf;
 use crate::crypto::{ActiveKeyExchange, CryptoProvider, SecureRandom, SharedSecret};
 use crate::enums::CipherSuite;
-use crate::error::Error;
+use crate::error::{Error, PeerMisbehaved};
 use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::{KeyShareEntry, Random};
 use crate::SupportedCipherSuite;
 
+/// ML-KEM-768 encapsulation key and ciphertext sizes, FIPS 203 table 3.
+const MLKEM768_ENCAPSULATION_KEY_LEN: usize = 1184;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+
+const INVALID_KEY_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
+
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "std")]
 use std::sync::Mutex;
 
@@ -77,6 +90,10 @@ pub struct RealityConfig {
     /// and consumed by RealityServerCertVerifier
     #[cfg(feature = "std")]
     pub(crate) auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Set by RealityServerCertVerifier when the server proves it is REALITY,
+    /// cleared by every new ClientHello; see `is_authenticated`
+    #[cfg(feature = "std")]
+    pub(crate) authenticated: Arc<AtomicBool>,
 }
 
 impl RealityConfig {
@@ -110,7 +127,25 @@ impl RealityConfig {
             client_version: [0, 0, 0],
             #[cfg(feature = "std")]
             auth_key_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "std")]
+            authenticated: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Whether the latest handshake made with this configuration was
+    /// authenticated by a REALITY server
+    ///
+    /// False after a handshake that completed with an ordinary certificate:
+    /// the server did not recognise the hello (wrong key, short id or SNI, or
+    /// a hello it refuses) and passed the connection to its target site, so
+    /// nothing meant for the proxy belongs on it. The handshake itself is let
+    /// through, as a browser's would be; deciding what to do next is the
+    /// caller's job. Clone the configuration before handing it to
+    /// `with_reality` to keep a handle that can ask.
+    #[cfg(feature = "std")]
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
+            .load(Ordering::Acquire)
     }
 
     /// Set the client version field
@@ -236,6 +271,12 @@ pub(crate) struct RealitySessionState {
     /// ECDH shared secret with server's static public key (32 bytes)
     /// Used for Reality authentication (session_id encryption)
     auth_shared_secret: [u8; 32],
+    /// Seed of the ML-KEM-768 decapsulation key behind the X25519MLKEM768
+    /// share. FIPS 203 treats the seed as the private key; the key itself is
+    /// rebuilt from it only if the server picks the hybrid group.
+    mlkem_seed: [u8; 64],
+    /// The X25519MLKEM768 share as sent: encapsulation key, then client_public.
+    hybrid_public: Vec<u8>,
 }
 
 impl RealitySessionState {
@@ -254,28 +295,53 @@ impl RealitySessionState {
         // Step 2: Perform ECDH with server's static public key (for Reality authentication)
         let auth_shared_secret = x25519_ecdh(&client_private, &config.server_public_key)?;
 
+        // Step 3: ML-KEM-768 keypair for the hybrid share
+        let mut mlkem_seed = [0u8; 64];
+        crypto_provider
+            .secure_random
+            .fill(&mut mlkem_seed)?;
+        let mut hybrid_public = Vec::with_capacity(MLKEM768_ENCAPSULATION_KEY_LEN + 32);
+        hybrid_public.extend_from_slice(
+            &mlkem768_decapsulation_key(&mlkem_seed)
+                .encapsulation_key()
+                .to_bytes(),
+        );
+        hybrid_public.extend_from_slice(&client_public);
+
         Ok(Self {
             config,
             client_private,
             client_public,
             auth_shared_secret,
+            mlkem_seed,
+            hybrid_public,
         })
     }
 
-    /// Generate KeyShareEntry for ClientHello key_share extension
+    /// KeyShareEntries for the ClientHello key_share extension
     ///
-    /// Returns a key_share entry containing the client's ephemeral X25519 public key.
-    pub(crate) fn key_share_entry(&self) -> KeyShareEntry {
-        KeyShareEntry::new(NamedGroup::X25519, self.client_public.to_vec())
+    /// X25519MLKEM768 first, then X25519, both carrying client_public: the
+    /// pair Chrome and Go send. Since REALITY 8cdf7bf9 (Xray 26.9) it is also
+    /// the only shape the server accepts - a hello without the hybrid share in
+    /// front of the X25519 one goes to the target site unauthenticated. The
+    /// server authenticates the X25519 key and then completes the handshake
+    /// with whatever group the target chose, so the hybrid has to be real.
+    pub(crate) fn key_share_entries(&self) -> Vec<KeyShareEntry> {
+        vec![
+            KeyShareEntry::new(NamedGroup::X25519MLKEM768, self.hybrid_public.clone()),
+            KeyShareEntry::new(NamedGroup::X25519, self.client_public.to_vec()),
+        ]
     }
 
     /// Convert Reality state into an ActiveKeyExchange for TLS handshake
     ///
-    /// This wraps the Reality X25519 keypair so it can be used in the TLS key schedule.
+    /// This wraps the Reality keys so they can be used in the TLS key schedule.
     pub(crate) fn into_key_exchange(self) -> Box<dyn ActiveKeyExchange> {
         Box::new(RealityKeyExchange {
             client_private: self.client_private,
             client_public: self.client_public,
+            mlkem_seed: self.mlkem_seed,
+            hybrid_public: self.hybrid_public,
         })
     }
 
@@ -338,6 +404,10 @@ impl RealitySessionState {
         if let Some(mut slot) = self.config.auth_key_slot.lock().ok() {
             *slot = Some(auth_key);
         }
+        #[cfg(feature = "std")]
+        self.config
+            .authenticated
+            .store(false, Ordering::Release);
 
         Ok(result)
     }
@@ -345,41 +415,95 @@ impl RealitySessionState {
 
 /// ActiveKeyExchange implementation for Reality protocol
 ///
-/// This wraps the Reality X25519 keypair to provide it to the TLS key schedule.
+/// This wraps the Reality keys to provide them to the TLS key schedule.
 /// Reality uses the same X25519 keypair for both:
 /// 1. Authentication ECDH with server's static public key (for session_id encryption)
 /// 2. TLS ECDH with server's ephemeral public key from ServerHello (for TLS key schedule)
+///
+/// It is offered as X25519MLKEM768 with X25519 as its hybrid component, the
+/// way rustls offers a hybrid group from the provider: the ServerHello then
+/// settles which of the two `complete` methods runs.
 struct RealityKeyExchange {
     client_private: [u8; 32],
     client_public: [u8; 32],
+    mlkem_seed: [u8; 64],
+    hybrid_public: Vec<u8>,
 }
 
 impl ActiveKeyExchange for RealityKeyExchange {
-    /// Complete the key exchange
+    /// Complete X25519MLKEM768
+    ///
+    /// The server share is an ML-KEM-768 ciphertext followed by an X25519 key,
+    /// and the shared secret is the ML-KEM one followed by the X25519 one.
+    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+        if peer_pub_key.len() != MLKEM768_CIPHERTEXT_LEN + 32 {
+            return Err(INVALID_KEY_SHARE);
+        }
+        let (ciphertext, peer_x25519) = peer_pub_key.split_at(MLKEM768_CIPHERTEXT_LEN);
+
+        let mlkem_shared_secret = mlkem768_decapsulation_key(&self.mlkem_seed)
+            .decapsulate_slice(ciphertext)
+            .map_err(|_| INVALID_KEY_SHARE)?;
+        let x25519_shared_secret = x25519_complete(&self.client_private, peer_x25519)?;
+
+        let mut secret = Vec::with_capacity(64);
+        secret.extend_from_slice(&mlkem_shared_secret);
+        secret.extend_from_slice(&x25519_shared_secret);
+        Ok(SharedSecret::from(secret))
+    }
+
+    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+        Some((NamedGroup::X25519, &self.client_public))
+    }
+
+    /// Complete plain X25519
     ///
     /// Performs ECDH with the server's ephemeral public key from ServerHello
     /// to derive the TLS shared secret for the key schedule.
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
-        // Convert peer_pub_key to [u8; 32]
-        let peer_public: [u8; 32] = peer_pub_key
-            .try_into()
-            .map_err(|_| Error::General("Invalid peer public key length".into()))?;
-
-        // Perform ECDH with ServerHello's ephemeral public key (for TLS key schedule)
-        let tls_shared_secret = x25519_ecdh(&self.client_private, &peer_public)?;
-
+    fn complete_hybrid_component(
+        self: Box<Self>,
+        peer_pub_key: &[u8],
+    ) -> Result<SharedSecret, Error> {
+        let tls_shared_secret = x25519_complete(&self.client_private, peer_pub_key)?;
         Ok(SharedSecret::from(&tls_shared_secret[..]))
     }
 
-    /// Return the client's public key
+    /// Return the hybrid share as sent
     fn pub_key(&self) -> &[u8] {
-        &self.client_public
+        &self.hybrid_public
     }
 
-    /// Return the named group (always X25519 for Reality)
     fn group(&self) -> NamedGroup {
-        NamedGroup::X25519
+        NamedGroup::X25519MLKEM768
     }
+}
+
+/// Rebuild the ML-KEM-768 decapsulation key from its seed
+fn mlkem768_decapsulation_key(seed: &[u8; 64]) -> ml_kem::DecapsulationKey<MlKem768> {
+    ml_kem::DecapsulationKey::from_seed((*seed).into())
+}
+
+/// ECDH with the X25519 key from a ServerHello
+fn x25519_complete(client_private: &[u8; 32], peer_pub_key: &[u8]) -> Result<[u8; 32], Error> {
+    let peer_public: [u8; 32] = peer_pub_key
+        .try_into()
+        .map_err(|_| INVALID_KEY_SHARE)?;
+    x25519_ecdh(client_private, &peer_public)
+}
+
+/// Put X25519MLKEM768 in supported_groups just ahead of X25519
+///
+/// The provider may lack the group (`ring` has no ML-KEM), but Reality sends
+/// the hybrid share regardless, and a TLS 1.3 server rejects a share for a
+/// group missing from supported_groups - for Reality that server is the target
+/// site the hello is forwarded to.
+pub(crate) fn offer_hybrid_group(groups: &mut Vec<NamedGroup>) {
+    groups.retain(|group| *group != NamedGroup::X25519MLKEM768);
+    let at = groups
+        .iter()
+        .position(|group| *group == NamedGroup::X25519)
+        .unwrap_or(0);
+    groups.insert(at, NamedGroup::X25519MLKEM768);
 }
 
 // X25519 ECDH is now handled through the unified CryptoProvider::x25519_provider interface
@@ -628,8 +752,11 @@ fn verify_reality_cert(
 /// X.509v1 certs lack the `version` field that webpki requires.
 ///
 /// This verifier first attempts the REALITY HMAC check; if it passes the cert
-/// is accepted without a CA chain. If it fails (normal TLS destination), the
-/// inner verifier is tried.
+/// is accepted without a CA chain and the session counts as authenticated
+/// (`RealityConfig::is_authenticated`). If it fails (normal TLS destination,
+/// which is where a REALITY server sends a hello it does not recognise), the
+/// inner verifier is tried, as Xray's client does: the handshake ends the
+/// way a browser's would, and the caller learns it reached the wrong place.
 ///
 /// `verify_tls13_signature` similarly tries the inner verifier first; if that
 /// fails it falls back to direct Ed25519 verification using the pubkey found
@@ -641,6 +768,8 @@ pub struct RealityServerCertVerifier {
     auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
     /// Fallback verifier (used when the cert is not a REALITY cert)
     inner: Arc<dyn crate::verify::ServerCertVerifier>,
+    /// Shared with RealityConfig: set when the cert is a REALITY cert
+    authenticated: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "std")]
@@ -648,9 +777,14 @@ impl RealityServerCertVerifier {
     /// Create a new verifier wrapping `inner`.
     pub fn new(
         auth_key_slot: Arc<Mutex<Option<[u8; 32]>>>,
+        authenticated: Arc<AtomicBool>,
         inner: Arc<dyn crate::verify::ServerCertVerifier>,
     ) -> Arc<Self> {
-        Arc::new(Self { auth_key_slot, inner })
+        Arc::new(Self {
+            auth_key_slot,
+            inner,
+            authenticated,
+        })
     }
 }
 
@@ -673,6 +807,10 @@ impl crate::verify::ServerCertVerifier for RealityServerCertVerifier {
 
         if let Some(ref key) = auth_key {
             if let Some(result) = verify_reality_cert(end_entity, key) {
+                if result.is_ok() {
+                    self.authenticated
+                        .store(true, Ordering::Release);
+                }
                 return result;
             }
         }
@@ -919,12 +1057,167 @@ mod tests {
         let provider = CryptoProvider::get_default().expect("No default crypto provider installed");
 
         let state = RealitySessionState::new(config, provider).unwrap();
-        let key_share = state.key_share_entry();
+        let key_shares = state.key_share_entries();
 
-        // Verify key_share uses X25519
-        assert_eq!(key_share.group, NamedGroup::X25519);
-        // Verify key_share payload is 32 bytes (X25519 public key)
-        assert_eq!(key_share.payload.0.len(), 32);
+        // The hybrid first, then X25519, both carrying the same X25519 key
+        assert_eq!(key_shares.len(), 2);
+        assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
+        assert_eq!(
+            key_shares[0].payload.0.len(),
+            MLKEM768_ENCAPSULATION_KEY_LEN + 32
+        );
+        assert_eq!(key_shares[1].group, NamedGroup::X25519);
+        assert_eq!(key_shares[1].payload.0, state.client_public);
+        assert_eq!(
+            key_shares[0].payload.0[MLKEM768_ENCAPSULATION_KEY_LEN..],
+            state.client_public
+        );
+    }
+
+    #[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+    #[test]
+    fn test_key_exchange_completes_either_group() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        #[cfg(feature = "ring")]
+        let _ = crate::crypto::ring::default_provider().install_default();
+        #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+        let _ = crate::crypto::aws_lc_rs::default_provider().install_default();
+
+        let config = Arc::new(RealityConfig::new([1u8; 32], vec![0x12]).unwrap());
+        let provider = CryptoProvider::get_default().unwrap();
+        let state = RealitySessionState::new(config, provider).unwrap();
+
+        // Play the server: encapsulate to our key, and an X25519 key of its own
+        let encapsulation_key: ml_kem::Key<ml_kem::EncapsulationKey<MlKem768>> = state
+            .hybrid_public[..MLKEM768_ENCAPSULATION_KEY_LEN]
+            .try_into()
+            .unwrap();
+        let (ciphertext, mlkem_secret) =
+            ml_kem::EncapsulationKey::<MlKem768>::new(&encapsulation_key)
+                .unwrap()
+                .encapsulate_deterministic(&[7u8; 32].into());
+        let server_private = StaticSecret::from([0x42u8; 32]);
+        let server_public = PublicKey::from(&server_private).to_bytes();
+        let x25519_secret = server_private
+            .diffie_hellman(&PublicKey::from(state.client_public))
+            .to_bytes();
+
+        let mut server_share = ciphertext.to_vec();
+        server_share.extend_from_slice(&server_public);
+        let mut expected = mlkem_secret.to_vec();
+        expected.extend_from_slice(&x25519_secret);
+
+        let kx = state.clone().into_key_exchange();
+        assert_eq!(kx.group(), NamedGroup::X25519MLKEM768);
+        assert_eq!(kx.pub_key(), &state.hybrid_public[..]);
+        assert_eq!(
+            kx.hybrid_component(),
+            Some((NamedGroup::X25519, &state.client_public[..]))
+        );
+        let secret = kx.complete(&server_share).unwrap();
+        assert_eq!(secret.secret_bytes(), &expected[..]);
+
+        let kx = state.clone().into_key_exchange();
+        let secret = kx
+            .complete_hybrid_component(&server_public)
+            .unwrap();
+        assert_eq!(secret.secret_bytes(), &x25519_secret[..]);
+
+        // A share of the wrong shape is the server's fault, not a panic
+        let kx = state.into_key_exchange();
+        assert_eq!(kx.complete(&server_public).err(), Some(INVALID_KEY_SHARE));
+    }
+
+    #[cfg(all(feature = "std", any(feature = "ring", feature = "aws_lc_rs")))]
+    #[test]
+    fn test_only_a_reality_certificate_authenticates() {
+        use pki_types::{CertificateDer, ServerName, UnixTime};
+
+        use crate::verify::ServerCertVerifier;
+
+        #[cfg(feature = "ring")]
+        let provider = Arc::new(crate::crypto::ring::default_provider());
+        #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+        let provider = Arc::new(crate::crypto::aws_lc_rs::default_provider());
+
+        let mut roots = crate::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_slice(include_bytes!(
+                "../../../test-ca/rsa-2048/ca.der"
+            )))
+            .unwrap();
+        let inner =
+            crate::webpki::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap();
+
+        let config = RealityConfig::new([1u8; 32], vec![0x12]).unwrap();
+        let auth_key = [9u8; 32];
+        *config.auth_key_slot.lock().unwrap() = Some(auth_key);
+        let verifier = RealityServerCertVerifier::new(
+            Arc::clone(&config.auth_key_slot),
+            Arc::clone(&config.authenticated),
+            inner,
+        );
+        let server_name = ServerName::try_from("testserver.com").unwrap();
+        let now = UnixTime::now();
+
+        // The target site's own certificate, which any browser accepts: that is
+        // what comes back when the REALITY server does not recognise the hello.
+        let site = CertificateDer::from_slice(include_bytes!("../../../test-ca/rsa-2048/end.der"));
+        let intermediate =
+            CertificateDer::from_slice(include_bytes!("../../../test-ca/rsa-2048/inter.der"));
+        assert!(
+            verifier
+                .verify_server_cert(&site, &[intermediate], &server_name, &[], now)
+                .is_ok()
+        );
+        assert!(!config.is_authenticated());
+
+        // The REALITY server's certificate: an Ed25519 key, and the HMAC of it
+        // under the session's auth key in the last 64 bytes.
+        let ed25519_public = [7u8; 32];
+        let mut reality_cert = vec![0x30, 0x00, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        reality_cert.extend_from_slice(&ed25519_public);
+        reality_cert.extend_from_slice(&hmac_sha512(&auth_key, &ed25519_public));
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &CertificateDer::from(reality_cert),
+                    &[],
+                    &server_name,
+                    &[],
+                    now
+                )
+                .is_ok()
+        );
+        assert!(config.is_authenticated());
+    }
+
+    #[test]
+    fn test_offer_hybrid_group() {
+        use NamedGroup::{X25519, X25519MLKEM768, secp256r1, secp384r1};
+
+        let cases = [
+            (
+                vec![X25519, secp256r1],
+                vec![X25519MLKEM768, X25519, secp256r1],
+            ),
+            (
+                vec![X25519MLKEM768, X25519, secp384r1],
+                vec![X25519MLKEM768, X25519, secp384r1],
+            ),
+            (vec![X25519, X25519MLKEM768], vec![X25519MLKEM768, X25519]),
+            (
+                vec![secp256r1, X25519],
+                vec![secp256r1, X25519MLKEM768, X25519],
+            ),
+        ];
+        for (mut groups, expected) in cases {
+            offer_hybrid_group(&mut groups);
+            assert_eq!(groups, expected);
+        }
     }
 
     #[cfg(any(feature = "ring", feature = "aws_lc_rs"))]

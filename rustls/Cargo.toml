@@ -39,6 +39,7 @@ brotli = { workspace = true, optional = true }
 brotli-decompressor = { workspace = true, optional = true }
 hashbrown = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
+ml-kem = { workspace = true }
 # only required for no-std
 once_cell = { workspace = true }
 ring = { workspace = true, optional = true }

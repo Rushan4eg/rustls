@@ -793,6 +793,92 @@ fn test_reality_session_id_not_overwritten_by_session_id_generator() {
     );
 }
 
+/// Read a Reality hello the way an Xray server has since REALITY 8cdf7bf9
+/// (Xray 26.9): an X25519MLKEM768 share, then an X25519 one, the auth key from
+/// the X25519 one, and the session id opened with the whole hello as AAD.
+/// Anything else and the connection goes to the target site instead.
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn reality_hello_passes_xray_authentication() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    use super::reality::{RealityConfig, get_hkdf_sha256_from_config};
+
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    use aws_lc_rs::aead;
+    #[cfg(feature = "ring")]
+    use ring::aead;
+
+    #[cfg(feature = "ring")]
+    let provider = Arc::new(crate::crypto::ring::default_provider());
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = Arc::new(crate::crypto::aws_lc_rs::default_provider());
+
+    let server_private = StaticSecret::from([0x42u8; 32]);
+    let server_public = PublicKey::from(&server_private).to_bytes();
+    let short_id = vec![0x1a, 0x46, 0xd6, 0x30];
+
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&crate::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_reality(RealityConfig::new(server_public, short_id.clone()).unwrap())
+        .with_no_client_auth();
+    let hello = WireClientHello::capture(config);
+
+    // A share for a group the hello does not support is illegal_parameter at
+    // the target, so the hybrid is named there too, ahead of X25519.
+    let groups = hello.named_groups();
+    let hybrid_at = groups
+        .iter()
+        .position(|group| *group == 0x11ec)
+        .expect("X25519MLKEM768 not in supported_groups");
+    assert_eq!(groups.get(hybrid_at + 1), Some(&0x001d), "{groups:04x?}");
+
+    let shares: Vec<(u16, Vec<u8>)> = hello
+        .key_shares()
+        .into_iter()
+        .filter(|(group, _)| !is_grease(*group))
+        .collect();
+    let order: Vec<u16> = shares
+        .iter()
+        .map(|(group, _)| *group)
+        .collect();
+    assert_eq!(order, vec![0x11ec, 0x001d]);
+    let (hybrid, x25519) = (&shares[0].1, &shares[1].1);
+    assert_eq!(hybrid.len(), 1184 + 32);
+    assert_eq!(&hybrid[1184..], &x25519[..], "two different X25519 keys");
+
+    let x25519: [u8; 32] = x25519[..].try_into().unwrap();
+    let shared = server_private
+        .diffie_hellman(&PublicKey::from(x25519))
+        .to_bytes();
+    let random = &hello.body[2..34];
+    let mut auth_key = [0u8; 32];
+    get_hkdf_sha256_from_config(&provider.cipher_suites)
+        .unwrap()
+        .extract_from_secret(Some(&random[..20]), &shared)
+        .expand_slice(&[b"REALITY"], &mut auth_key)
+        .unwrap();
+
+    assert_eq!(hello.body[34], 32, "session id length");
+    let mut sealed = hello.body[35..67].to_vec();
+    let mut aad = vec![0x01];
+    aad.extend_from_slice(&(hello.body.len() as u32).to_be_bytes()[1..]);
+    aad.extend_from_slice(&hello.body);
+    aad[4 + 35..4 + 67].fill(0);
+
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, &auth_key).unwrap());
+    let nonce = aead::Nonce::assume_unique_for_key(random[20..32].try_into().unwrap());
+    let plaintext = key
+        .open_in_place(nonce, aead::Aad::from(&aad), &mut sealed)
+        .expect("session id does not authenticate");
+
+    assert_eq!(&plaintext[..4], &[0, 0, 0, 0], "version and reserved");
+    assert_eq!(&plaintext[8..12], &short_id[..]);
+    assert_eq!(&plaintext[12..], &[0, 0, 0, 0], "short id padding");
+}
+
 // ---------------------------------------------------------------------------
 // ClientHello shaping
 //

@@ -198,7 +198,14 @@ impl ClientHelloInput {
                 .config
                 .find_kx_group(NamedGroup::X25519, ProtocolVersion::TLSv1_3)
                 .ok_or(Error::General("X25519 group required for Reality".into()))?;
-            cx.common.kx_state = KxState::Start(x25519_group);
+            // It also offers that share inside X25519MLKEM768. Name the hybrid
+            // when the provider has one to name: without (`ring`), a server that
+            // picks the hybrid is reported as having negotiated X25519.
+            let offered_group = self
+                .config
+                .find_kx_group(NamedGroup::X25519MLKEM768, ProtocolVersion::TLSv1_3)
+                .unwrap_or(x25519_group);
+            cx.common.kx_state = KxState::Start(offered_group);
             None
         } else if self.config.needs_key_share() {
             Some(tls13::initial_key_share(
@@ -254,10 +261,10 @@ where
 {
     // If Reality is enabled, convert Reality state into ActiveKeyExchange
     // This ensures the Reality shared secret is used for TLS key schedule
-    let (key_share, reality_key_share_entry) = if let Some(ref reality) = reality_state {
-        let entry = reality.key_share_entry();
+    let (key_share, reality_key_share_entries) = if let Some(ref reality) = reality_state {
+        let entries = reality.key_share_entries();
         let kx = reality.clone().into_key_exchange();
-        (Some(kx), Some(entry))
+        (Some(kx), Some(entries))
     } else {
         (key_share, None)
     };
@@ -352,9 +359,12 @@ where
     };
 
     // Add key_share extension
-    // If Reality is enabled, use Reality's key_share entry; otherwise use normal TLS key_share
-    if let Some(reality_entry) = reality_key_share_entry {
-        exts.key_shares = Some(vec![reality_entry]);
+    // If Reality is enabled, use Reality's key_share entries; otherwise use normal TLS key_share
+    if let Some(reality_entries) = reality_key_share_entries {
+        if let Some(groups) = exts.named_groups.as_mut() {
+            reality::offer_hybrid_group(groups);
+        }
+        exts.key_shares = Some(reality_entries);
     } else if let Some(key_share) = &key_share {
         debug_assert!(supported_versions.tls13);
         let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
