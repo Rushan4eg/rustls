@@ -1449,13 +1449,77 @@ fn grease_ech_needs_no_hpke_provider() {
     assert_eq!(u16::from_be_bytes([body[3], body[4]]), 0x0001, "aead");
     assert_eq!(u16::from_be_bytes([body[6], body[7]]), 32, "enc length");
 
-    // And the payload is sized like a real sealed inner hello: long enough to
-    // be one, and not a round number that would give it away.
+    // And the payload is sized the way Chrome sizes it: 32 * (4..=7) bytes
+    // plus the 16-byte AES-128-GCM tag.
     let enc_end = 8 + 32;
     let payload_len = u16::from_be_bytes([body[enc_end], body[enc_end + 1]]);
     assert!(
-        payload_len > 64,
-        "payload of {payload_len} bytes is too short to pass"
+        [144, 176, 208, 240].contains(&payload_len),
+        "payload of {payload_len} bytes is not a length Chrome sends"
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn grease_ech_payload_length_varies_like_chromes() {
+    use alloc::collections::BTreeMap;
+
+    use crate::client::{EchGreaseConfig, EchMode};
+    use crate::crypto::hpke::HpkeSuite;
+    use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use crate::msgs::handshake::HpkeSymmetricCipherSuite;
+
+    // One fixed length on every connection is a mark of its own, however
+    // plausible the number. Chrome picks one of four per connection.
+    let suite = HpkeSuite {
+        kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+        sym: HpkeSymmetricCipherSuite {
+            kdf_id: HpkeKdf::HKDF_SHA256,
+            aead_id: HpkeAead::AES_128_GCM,
+        },
+    };
+
+    #[cfg(feature = "ring")]
+    let provider = crate::crypto::ring::default_provider();
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = crate::crypto::aws_lc_rs::default_provider();
+    let provider = Arc::new(provider);
+
+    let mut counts: BTreeMap<u16, u32> = BTreeMap::new();
+    for _ in 0..400 {
+        let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_ech(EchMode::Grease(
+                EchGreaseConfig::without_provider(suite).unwrap(),
+            ))
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        let hello = WireClientHello::capture(config);
+        let body = hello
+            .extension(0xfe0d)
+            .expect("no encrypted_client_hello");
+        let enc_end = 8 + 32;
+        *counts
+            .entry(u16::from_be_bytes([body[enc_end], body[enc_end + 1]]))
+            .or_default() += 1;
+    }
+
+    // Only Chrome's four lengths, and each about equally often: 400 draws give
+    // each one 100 on average with a standard deviation under 9, so 60..=140 is
+    // more than four deviations either way.
+    assert_eq!(
+        counts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![144, 176, 208, 240],
+        "{counts:?}"
+    );
+    assert!(
+        counts
+            .values()
+            .all(|n| (60..=140).contains(n)),
+        "{counts:?}"
     );
 }
 
