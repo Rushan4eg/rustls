@@ -1051,7 +1051,23 @@ extension_struct! {
         /// browsers use the room after ECH: their trailing GREASE sits there,
         /// and the padding that follows it.
         pub(crate) final_extensions: Vec<RawExtension>,
+
+        /// Shuffle `appended_extensions` in with the generated ones instead
+        /// of writing them after.
+        pub(crate) shuffle_verbatim: bool,
+
+        /// Shuffle the encrypted client hello in too. Only for GREASE ECH:
+        /// a real offer keeps the place rustls gives it. Needs
+        /// `shuffle_verbatim`.
+        pub(crate) shuffle_ech: bool,
     }
+}
+
+/// One entry of a shuffled extension list: either one rustls generates, or
+/// one handed over verbatim.
+enum Shuffled<'e> {
+    Generated(ExtensionType),
+    Verbatim(&'e RawExtension),
 }
 
 impl ClientExtensions<'_> {
@@ -1086,6 +1102,8 @@ impl ClientExtensions<'_> {
             prepended_extensions,
             appended_extensions,
             final_extensions,
+            shuffle_verbatim,
+            shuffle_ech,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1117,6 +1135,8 @@ impl ClientExtensions<'_> {
             prepended_extensions,
             appended_extensions,
             final_extensions,
+            shuffle_verbatim,
+            shuffle_ech,
         }
     }
 
@@ -1202,12 +1222,58 @@ impl ClientExtensions<'_> {
             ) || self.contiguous_extensions.contains(ext))
         });
 
-        order.sort_by_cached_key(|new_ext| {
-            let seed = ((self.order_seed as u32) << 16) | (u16::from(*new_ext) as u32);
-            low_quality_integer_hash(seed)
-        });
+        order.sort_by_cached_key(|new_ext| self.order_key(u16::from(*new_ext)));
 
         order
+    }
+
+    /// Where an extension of this type falls in the random order.
+    ///
+    /// Depends on the seed and the type only, so a second hello after a
+    /// `HelloRetryRequest`, which keeps the seed, comes out in the same order.
+    fn order_key(&self, typ: u16) -> u32 {
+        low_quality_integer_hash(((self.order_seed as u32) << 16) | (typ as u32))
+    }
+
+    /// Whether the encrypted client hello goes into the shuffle rather than
+    /// after it.
+    fn ech_is_shuffled(&self) -> bool {
+        self.shuffle_verbatim
+            && self.shuffle_ech
+            && self.encrypted_client_hello.is_some()
+            && self
+                .encrypted_client_hello_outer
+                .is_none()
+    }
+
+    /// The random part of the list with the verbatim extensions, and GREASE
+    /// ECH if asked, mixed in.
+    ///
+    /// The same key as the generated extensions use, so mixing in the
+    /// verbatim ones leaves the generated ones in their relative order.
+    fn shuffled_with_verbatim(&self) -> Vec<Shuffled<'_>> {
+        let mut items: Vec<(u32, Shuffled<'_>)> = self
+            .order_insensitive_extensions_in_random_order()
+            .into_iter()
+            .map(|ext| (self.order_key(u16::from(ext)), Shuffled::Generated(ext)))
+            .collect();
+
+        items.extend(
+            self.appended_extensions
+                .iter()
+                .map(|raw| (self.order_key(raw.typ), Shuffled::Verbatim(raw))),
+        );
+
+        if self.ech_is_shuffled() {
+            let ech = ExtensionType::EncryptedClientHello;
+            items.push((self.order_key(u16::from(ech)), Shuffled::Generated(ech)));
+        }
+
+        items.sort_by_key(|(key, _)| *key);
+        items
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
     }
 }
 
@@ -1231,13 +1297,29 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
         for raw in &self.prepended_extensions {
             raw.encode(body.buf);
         }
-        for item in generated {
-            self.encode_one(item, body.buf);
+        if self.shuffle_verbatim {
+            for item in self.shuffled_with_verbatim() {
+                match item {
+                    Shuffled::Generated(ext) => self.encode_one(ext, body.buf),
+                    Shuffled::Verbatim(raw) => raw.encode(body.buf),
+                }
+            }
+            for ext in &self.contiguous_extensions {
+                self.encode_one(*ext, body.buf);
+            }
+        } else {
+            for item in generated {
+                self.encode_one(item, body.buf);
+            }
+            for raw in &self.appended_extensions {
+                raw.encode(body.buf);
+            }
         }
-        for raw in &self.appended_extensions {
-            raw.encode(body.buf);
-        }
+        let ech_shuffled = self.ech_is_shuffled();
         for item in ech {
+            if ech_shuffled && item == ExtensionType::EncryptedClientHello {
+                continue;
+            }
             self.encode_one(item, body.buf);
         }
         for raw in &self.final_extensions {

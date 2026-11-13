@@ -24,6 +24,7 @@ use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
 use crate::enums::{
     AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
+    SignatureScheme,
 };
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
@@ -296,10 +297,18 @@ where
                 .collect(),
         ),
         supported_versions: Some(supported_versions),
+        // A profile may advertise more than the verifier checks; what is
+        // accepted is still the verifier's call.
         signature_schemes: Some(
-            config
-                .verifier
-                .supported_verify_schemes(),
+            match &config
+                .client_hello_profile
+                .signature_schemes
+            {
+                Some(schemes) => schemes.clone(),
+                None => config
+                    .verifier
+                    .supported_verify_schemes(),
+            },
         ),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
@@ -447,6 +456,12 @@ where
     if matches!(cx.data.ech_status, EchStatus::Rejected | EchStatus::Grease) & retryreq.is_some() {
         if let Some(prev_ech_ext) = input.prev_ech_ext.take() {
             exts.encrypted_client_hello = Some(prev_ech_ext);
+            // Same place as in the first hello: the order seed is carried
+            // over, so the shuffle repeats itself exactly.
+            exts.shuffle_ech = cx.data.ech_status == EchStatus::Grease
+                && config
+                    .client_hello_profile
+                    .shuffle_extensions;
         }
     }
 
@@ -513,9 +528,17 @@ where
         supported_versions.grease = Some(grease.version);
         exts.supported_versions = Some(supported_versions);
 
+        if profile.grease_signature_schemes {
+            if let Some(schemes) = exts.signature_schemes.as_mut() {
+                schemes.insert(0, SignatureScheme::from(grease.signature_scheme));
+            }
+        }
+
         exts.prepended_extensions
             .push(RawExtension::empty(grease.first_extension));
     }
+
+    exts.shuffle_verbatim = profile.shuffle_extensions;
 
     exts.prepended_extensions.extend(
         profile
@@ -581,6 +604,7 @@ where
                 // Add the GREASE ECH extension.
                 let grease_ext = grease_ext?;
                 chp_payload.encrypted_client_hello = Some(grease_ext.clone());
+                chp_payload.extensions.shuffle_ech = profile.shuffle_extensions;
                 cx.data.ech_status = EchStatus::Grease;
                 // Store the GREASE ECH extension in case we need to carry it forward in a
                 // subsequent hello.

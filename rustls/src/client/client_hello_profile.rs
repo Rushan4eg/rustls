@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 use crate::Error;
 use crate::crypto::SecureRandom;
+use crate::enums::SignatureScheme;
 use crate::msgs::handshake::RawExtension;
 
 /// The sixteen values RFC 8701 reserves for GREASE.
@@ -83,6 +84,38 @@ pub struct ClientHelloProfile {
     /// Nothing else in the hello is derived from this field: the versions and
     /// key shares offered are still rustls own.
     pub cipher_suites: Option<Vec<u16>>,
+
+    /// The `signature_algorithms` list to put on the wire, in this order.
+    ///
+    /// By default rustls advertises what the certificate verifier can check.
+    /// A browser advertises schemes it has and rustls may not - Chrome 155
+    /// leads with the three ML-DSA codepoints - and the list is part of every
+    /// common fingerprint.
+    ///
+    /// Advertised only, like [`Self::cipher_suites`]: what is *accepted* is
+    /// still decided by the verifier. A server that signs with a scheme listed
+    /// here but unknown to the verifier fails the handshake, which is the
+    /// right outcome for a signature we cannot check.
+    pub signature_schemes: Option<Vec<SignatureScheme>>,
+
+    /// Put a GREASE value first in `signature_algorithms`.
+    ///
+    /// Chrome started doing this around version 152; earlier versions did not,
+    /// so it is a separate switch from [`Self::grease`]. Has no effect unless
+    /// `grease` is set too: the value comes from the same per-connection draw.
+    pub grease_signature_schemes: bool,
+
+    /// Mix the verbatim extensions and a GREASE ECH into the random extension
+    /// order, as Chrome does.
+    ///
+    /// rustls shuffles the extensions it generates, and by default writes the
+    /// caller's extensions and ECH after them in a fixed order. That tail is a
+    /// fingerprint of its own: a browser permutes everything between the
+    /// leading and trailing GREASE, so the same three or four extensions
+    /// closing every hello in the same order is something a browser does once
+    /// in tens of thousands of connections. Only GREASE ECH moves: a real ECH
+    /// offer stays where rustls puts it.
+    pub shuffle_extensions: bool,
 }
 
 /// When and how far to pad the `ClientHello`.
@@ -145,6 +178,7 @@ pub(crate) struct Grease {
     pub(crate) version: u16,
     pub(crate) first_extension: u16,
     pub(crate) last_extension: u16,
+    pub(crate) signature_scheme: u16,
 }
 
 impl Grease {
@@ -162,7 +196,7 @@ impl Grease {
     pub(crate) const LAST_EXTENSION_PAYLOAD: [u8; 1] = [0x00];
 
     pub(crate) fn new(random: &'static dyn SecureRandom) -> Result<Self, Error> {
-        let mut seed = [0u8; 5];
+        let mut seed = [0u8; 6];
         random.fill(&mut seed)?;
 
         let pick = |byte: u8| GREASE_VALUES[usize::from(byte & 0x0f)];
@@ -182,6 +216,7 @@ impl Grease {
             version: pick(seed[2]),
             first_extension,
             last_extension,
+            signature_scheme: pick(seed[5]),
         })
     }
 }
