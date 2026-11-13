@@ -1014,6 +1014,17 @@ impl WireClientHello {
         out
     }
 
+    /// signature_algorithms(13): a u16 length, then u16 schemes.
+    fn signature_schemes(&self) -> Vec<u16> {
+        let body = self
+            .extension(13)
+            .expect("no signature_algorithms");
+        body[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
     /// supported_versions(43): a u8 length, then u16 versions.
     fn versions(&self) -> Vec<u16> {
         let body = self
@@ -1449,13 +1460,77 @@ fn grease_ech_needs_no_hpke_provider() {
     assert_eq!(u16::from_be_bytes([body[3], body[4]]), 0x0001, "aead");
     assert_eq!(u16::from_be_bytes([body[6], body[7]]), 32, "enc length");
 
-    // And the payload is sized like a real sealed inner hello: long enough to
-    // be one, and not a round number that would give it away.
+    // And the payload is sized the way Chrome sizes it: 32 * (4..=7) bytes
+    // plus the 16-byte AES-128-GCM tag.
     let enc_end = 8 + 32;
     let payload_len = u16::from_be_bytes([body[enc_end], body[enc_end + 1]]);
     assert!(
-        payload_len > 64,
-        "payload of {payload_len} bytes is too short to pass"
+        [144, 176, 208, 240].contains(&payload_len),
+        "payload of {payload_len} bytes is not a length Chrome sends"
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn grease_ech_payload_length_varies_like_chromes() {
+    use alloc::collections::BTreeMap;
+
+    use crate::client::{EchGreaseConfig, EchMode};
+    use crate::crypto::hpke::HpkeSuite;
+    use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use crate::msgs::handshake::HpkeSymmetricCipherSuite;
+
+    // One fixed length on every connection is a mark of its own, however
+    // plausible the number. Chrome picks one of four per connection.
+    let suite = HpkeSuite {
+        kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+        sym: HpkeSymmetricCipherSuite {
+            kdf_id: HpkeKdf::HKDF_SHA256,
+            aead_id: HpkeAead::AES_128_GCM,
+        },
+    };
+
+    #[cfg(feature = "ring")]
+    let provider = crate::crypto::ring::default_provider();
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = crate::crypto::aws_lc_rs::default_provider();
+    let provider = Arc::new(provider);
+
+    let mut counts: BTreeMap<u16, u32> = BTreeMap::new();
+    for _ in 0..400 {
+        let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_ech(EchMode::Grease(
+                EchGreaseConfig::without_provider(suite).unwrap(),
+            ))
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        let hello = WireClientHello::capture(config);
+        let body = hello
+            .extension(0xfe0d)
+            .expect("no encrypted_client_hello");
+        let enc_end = 8 + 32;
+        *counts
+            .entry(u16::from_be_bytes([body[enc_end], body[enc_end + 1]]))
+            .or_default() += 1;
+    }
+
+    // Only Chrome's four lengths, and each about equally often: 400 draws give
+    // each one 100 on average with a standard deviation under 9, so 60..=140 is
+    // more than four deviations either way.
+    assert_eq!(
+        counts
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![144, 176, 208, 240],
+        "{counts:?}"
+    );
+    assert!(
+        counts
+            .values()
+            .all(|n| (60..=140).contains(n)),
+        "{counts:?}"
     );
 }
 
@@ -1521,4 +1596,220 @@ fn the_trailing_grease_extension_goes_after_ech() {
     let last_two = &types[types.len() - 2..];
     assert_eq!(last_two[0], 0xfe0d, "extensions: {types:04x?}");
     assert!(is_grease(last_two[1]), "extensions: {types:04x?}");
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn grease_leads_a_dictated_signature_algorithm_list() {
+    // Chrome 155: GREASE, then ML-DSA, then the schemes it had before. The
+    // ML-DSA codepoints are advertised whether or not anything here can
+    // verify them, which is what `signature_schemes` is for.
+    let wanted = vec![
+        SignatureScheme::ML_DSA_44,
+        SignatureScheme::ML_DSA_65,
+        SignatureScheme::ML_DSA_87,
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+        SignatureScheme::RSA_PSS_SHA256,
+    ];
+    let hello = WireClientHello::capture(client_config_with_profile(
+        crate::client::ClientHelloProfile {
+            grease: true,
+            grease_signature_schemes: true,
+            signature_schemes: Some(wanted.clone()),
+            ..Default::default()
+        },
+    ));
+
+    let schemes = hello.signature_schemes();
+    assert!(is_grease(schemes[0]), "{schemes:04x?}");
+    assert_eq!(
+        schemes[1..],
+        wanted
+            .iter()
+            .map(|scheme| u16::from(*scheme))
+            .collect::<Vec<_>>()[..],
+        "{schemes:04x?}"
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn signature_algorithms_are_greased_only_when_asked() {
+    // Chrome 133 GREASEd every list but this one, so `grease` alone must not
+    // reach it - and `grease_signature_schemes` alone has no value to put in.
+    for profile in [
+        crate::client::ClientHelloProfile {
+            grease: true,
+            ..Default::default()
+        },
+        crate::client::ClientHelloProfile {
+            grease_signature_schemes: true,
+            ..Default::default()
+        },
+    ] {
+        let hello = WireClientHello::capture(client_config_with_profile(profile));
+        let schemes = hello.signature_schemes();
+        assert!(!schemes.iter().copied().any(is_grease), "{schemes:04x?}");
+    }
+}
+
+/// A profile shaped like the tail of Chrome's hello: the extensions rustls
+/// does not model, GREASE ECH, and the shuffle switched on.
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+fn shuffling_profile_config() -> ClientConfig {
+    use crate::client::{ClientHelloProfile, EchGreaseConfig, EchMode};
+    use crate::crypto::hpke::HpkeSuite;
+    use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use crate::msgs::handshake::{HpkeSymmetricCipherSuite, RawExtension};
+
+    #[cfg(feature = "ring")]
+    let provider = crate::crypto::ring::default_provider();
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = crate::crypto::aws_lc_rs::default_provider();
+
+    let mut config = ClientConfig::builder_with_provider(provider.into())
+        .with_ech(EchMode::Grease(
+            EchGreaseConfig::without_provider(HpkeSuite {
+                kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+                sym: HpkeSymmetricCipherSuite {
+                    kdf_id: HpkeKdf::HKDF_SHA256,
+                    aead_id: HpkeAead::AES_128_GCM,
+                },
+            })
+            .unwrap(),
+        ))
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+    config.client_hello_profile = Arc::new(ClientHelloProfile {
+        grease: true,
+        shuffle_extensions: true,
+        append_extensions: vec![
+            RawExtension {
+                typ: 0xff01,
+                payload: vec![0x00],
+            },
+            RawExtension::empty(0x0012),
+            RawExtension {
+                typ: 0x44cd,
+                payload: b"\x00\x03\x02h2".to_vec(),
+            },
+            RawExtension {
+                typ: 0xca34,
+                payload: vec![0x00, 0x00],
+            },
+        ],
+        ..Default::default()
+    });
+    config
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn a_shuffling_profile_leaves_no_fixed_tail() {
+    use alloc::collections::{BTreeMap, BTreeSet};
+
+    // Without the shuffle these five closed every hello, always in this order:
+    // a browser does that once in tens of thousands of connections.
+    const MOVED: [u16; 5] = [0xff01, 0x0012, 0x44cd, 0xca34, 0xfe0d];
+
+    let rounds = 300;
+    let mut positions: BTreeMap<u16, BTreeSet<usize>> = BTreeMap::new();
+    let mut tails = BTreeSet::new();
+    let mut ech_last = 0;
+
+    for _ in 0..rounds {
+        let hello = WireClientHello::capture(shuffling_profile_config());
+        let types = hello.extension_types();
+
+        // GREASE still brackets the list, as in Chrome.
+        assert!(is_grease(types[0]), "{types:04x?}");
+        assert!(is_grease(*types.last().unwrap()), "{types:04x?}");
+
+        for typ in MOVED {
+            let at = types
+                .iter()
+                .position(|t| *t == typ)
+                .unwrap_or_else(|| panic!("{typ:04x} missing from {types:04x?}"));
+            positions
+                .entry(typ)
+                .or_default()
+                .insert(at);
+        }
+
+        let before_grease = types.len() - 1;
+        if types[before_grease - 1] == 0xfe0d {
+            ech_last += 1;
+        }
+        tails.insert(types[before_grease - 4..before_grease].to_vec());
+    }
+
+    for (typ, seen) in &positions {
+        assert!(seen.len() >= 8, "{typ:04x} only ever at {seen:?}");
+    }
+    // About one hello in fourteen by chance; every one of them before.
+    assert!(ech_last < rounds / 4, "ECH last in {ech_last} of {rounds}");
+    assert!(
+        tails.len() > rounds / 2,
+        "only {} different tails in {rounds} hellos",
+        tails.len()
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn the_retried_hello_keeps_the_shuffled_order() {
+    use crate::msgs::codec::Codec;
+    use crate::msgs::handshake::HelloRetryRequestExtensions;
+
+    let mut conn = ClientConnection::new(
+        shuffling_profile_config().into(),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let mut sent = Vec::new();
+    conn.write_tls(&mut sent).unwrap();
+    let first = WireClientHello::parse(&sent);
+
+    // A retry with only a cookie in it: the second hello has to repeat the
+    // first, the new cookie aside, order of extensions included.
+    let sid_len = first.body[34] as usize;
+    let session_id = SessionId::read(&mut Reader::init(&first.body[34..35 + sid_len])).unwrap();
+    let hrr = Message {
+        version: ProtocolVersion::TLSv1_3,
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id,
+                extensions: HelloRetryRequestExtensions {
+                    cookie: Some(PayloadU16::new(vec![1, 2, 3, 4])),
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+    conn.read_tls(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    conn.process_new_packets().unwrap();
+
+    let mut sent = Vec::new();
+    conn.write_tls(&mut sent).unwrap();
+    // Middlebox compatibility may put a ChangeCipherSpec record first.
+    let mut at = 0;
+    while sent[at] != 0x16 {
+        at += 5 + u16::from_be_bytes([sent[at + 3], sent[at + 4]]) as usize;
+    }
+    let second = WireClientHello::parse(&sent[at..]);
+
+    assert!(second.extension(0x002c).is_some(), "no cookie in the retry");
+    let without_cookie = |hello: &WireClientHello| {
+        hello
+            .extension_types()
+            .into_iter()
+            .filter(|typ| *typ != 0x002c)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(without_cookie(&first), without_cookie(&second));
 }

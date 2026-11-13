@@ -855,12 +855,18 @@ impl crate::verify::ServerCertVerifier for RealityServerCertVerifier {
         ))
     }
 
+    /// The inner verifier's list, as is.
+    ///
+    /// This list goes out in the hello's signature_algorithms. Appending
+    /// Ed25519 to it, as this used to, put 0x0807 at the end of a Chrome
+    /// profile's list, where neither Chrome nor uTLS has it: a mark on every
+    /// connection. It is not needed either. A REALITY server signs with its
+    /// Ed25519 key whatever the hello offers (uTLS clients never offer it), and
+    /// `verify_tls13_signature` above checks that signature itself once the
+    /// inner verifier declines it. Nothing on the client side compares the
+    /// server's scheme against this list.
     fn supported_verify_schemes(&self) -> Vec<crate::enums::SignatureScheme> {
-        let mut schemes = self.inner.supported_verify_schemes();
-        if !schemes.contains(&crate::enums::SignatureScheme::ED25519) {
-            schemes.push(crate::enums::SignatureScheme::ED25519);
-        }
-        schemes
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -1193,6 +1199,103 @@ mod tests {
                 .is_ok()
         );
         assert!(config.is_authenticated());
+    }
+
+    /// A verifier that offers a browser's list and accepts nothing, the way a
+    /// pinned Chrome verifier treats a REALITY server's Ed25519 signature.
+    #[derive(Debug)]
+    struct ChromeListOnly;
+
+    const CHROME_SCHEMES: [crate::enums::SignatureScheme; 3] = [
+        crate::enums::SignatureScheme::ECDSA_NISTP256_SHA256,
+        crate::enums::SignatureScheme::RSA_PSS_SHA256,
+        crate::enums::SignatureScheme::RSA_PKCS1_SHA256,
+    ];
+
+    impl crate::verify::ServerCertVerifier for ChromeListOnly {
+        fn verify_server_cert(
+            &self,
+            _: &pki_types::CertificateDer<'_>,
+            _: &[pki_types::CertificateDer<'_>],
+            _: &pki_types::ServerName<'_>,
+            _: &[u8],
+            _: pki_types::UnixTime,
+        ) -> Result<crate::verify::ServerCertVerified, Error> {
+            Err(Error::General("not this one".into()))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &pki_types::CertificateDer<'_>,
+            _: &crate::verify::DigitallySignedStruct,
+        ) -> Result<crate::verify::HandshakeSignatureValid, Error> {
+            Err(Error::General("not this one".into()))
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &pki_types::CertificateDer<'_>,
+            _: &crate::verify::DigitallySignedStruct,
+        ) -> Result<crate::verify::HandshakeSignatureValid, Error> {
+            Err(Error::General("not this one".into()))
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<crate::enums::SignatureScheme> {
+            CHROME_SCHEMES.to_vec()
+        }
+    }
+
+    #[cfg(feature = "ring")]
+    #[test]
+    fn test_hello_offers_the_inner_list_and_ed25519_still_verifies() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        use crate::verify::{DigitallySignedStruct, ServerCertVerifier};
+
+        let config = RealityConfig::new([1u8; 32], vec![0x12]).unwrap();
+        let verifier = RealityServerCertVerifier::new(
+            Arc::clone(&config.auth_key_slot),
+            Arc::clone(&config.authenticated),
+            Arc::new(ChromeListOnly),
+        );
+
+        // What goes out in the hello: Chrome's list, with no Ed25519 tacked on.
+        assert_eq!(verifier.supported_verify_schemes(), CHROME_SCHEMES.to_vec());
+
+        // And the server's Ed25519 CertificateVerify is accepted all the same.
+        let key = Ed25519KeyPair::from_seed_unchecked(&[5u8; 32]).unwrap();
+        let mut cert = vec![0x30, 0x00, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        cert.extend_from_slice(key.public_key().as_ref());
+        cert.extend_from_slice(&[0u8; 64]);
+        let message = b"TLS 1.3, server CertificateVerify";
+        let signed = DigitallySignedStruct::new(
+            crate::enums::SignatureScheme::ED25519,
+            key.sign(message).as_ref().to_vec(),
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(
+                    message,
+                    &pki_types::CertificateDer::from(cert.clone()),
+                    &signed
+                )
+                .is_ok()
+        );
+
+        // A signature that does not check out is still refused.
+        let forged = DigitallySignedStruct::new(
+            crate::enums::SignatureScheme::ED25519,
+            key.sign(b"something else")
+                .as_ref()
+                .to_vec(),
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(message, &pki_types::CertificateDer::from(cert), &forged)
+                .is_err()
+        );
     }
 
     #[test]

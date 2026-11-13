@@ -273,7 +273,9 @@ impl EchGreaseConfig {
         &self,
         secure_random: &'static dyn SecureRandom,
         inner_name: ServerName<'static>,
-        outer_hello: &ClientHelloPayload,
+        // Unused since the payload is sized like Chrome's rather than by the
+        // inner hello; kept so the call site stays the same as upstream.
+        _outer_hello: &ClientHelloPayload,
     ) -> Result<EncryptedClientHello, Error> {
         trace!("Preparing GREASE ECH extension");
 
@@ -354,12 +356,16 @@ impl EchGreaseConfig {
             )?,
         };
 
-        // Construct an inner hello using the outer hello - this allows us to know the size of
-        // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
-
-        // Generate a payload of random data equivalent in length to a real inner hello.
-        let payload_len = encoded_inner_hello.len()
+        // Size the payload the way Chrome does, not by our own inner hello.
+        //
+        // BoringSSL picks `32 * random(4..=7)` bytes plus the AEAD tag, so a
+        // browser's GREASE payload is one of 144, 176, 208 or 240 bytes with
+        // AES-128-GCM. Sizing it by the inner hello made ours a constant 400:
+        // the same length on every connection and far outside what Chrome
+        // sends, which marks the hello as not Chrome's.
+        let mut pick = [0u8; 1];
+        secure_random.fill(&mut pick)?;
+        let payload_len = 32 * (4 + usize::from(pick[0] % 4))
             + suite
                 .sym
                 .aead_id
