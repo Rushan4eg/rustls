@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use crate::Error;
 use crate::crypto::SecureRandom;
 use crate::enums::SignatureScheme;
+use crate::msgs::enums::NamedGroup;
 use crate::msgs::handshake::RawExtension;
 
 /// The sixteen values RFC 8701 reserves for GREASE.
@@ -116,6 +117,51 @@ pub struct ClientHelloProfile {
     /// in tens of thousands of connections. Only GREASE ECH moves: a real ECH
     /// offer stays where rustls puts it.
     pub shuffle_extensions: bool,
+
+    /// Write the extensions in exactly this order, by type.
+    ///
+    /// Firefox does not permute its extensions: every hello it sends carries
+    /// them in one order, and that order is as much a part of its fingerprint
+    /// as the set. rustls shuffles what it generates, so a Firefox profile
+    /// needs the order dictated.
+    ///
+    /// Every extension in the hello is placed by this list - generated,
+    /// verbatim and encrypted client hello alike. Types the list does not
+    /// name keep their relative order and go after the named ones, and the
+    /// pre-shared key offer stays last whatever the list says, as the
+    /// standard requires. Overrides [`Self::shuffle_extensions`].
+    pub extension_order: Option<Vec<u16>>,
+
+    /// The `supported_groups` list to put on the wire, in this order.
+    ///
+    /// By default rustls advertises the key exchange groups its provider
+    /// holds. Firefox also lists P-521 and two finite field groups, which no
+    /// rustls provider implements.
+    ///
+    /// Advertised only, like [`Self::cipher_suites`]: key shares are still
+    /// made from the provider, and a server that asks for a group the provider
+    /// lacks in a `HelloRetryRequest` fails the handshake. Servers ask for a
+    /// group only when none of the shares offered suits them, so listing the
+    /// groups the shares cover first keeps that to servers that would refuse
+    /// them anyway.
+    pub named_groups: Option<Vec<NamedGroup>>,
+
+    /// Key shares to offer after the ones rustls offers itself.
+    ///
+    /// rustls offers a share for its first group, plus the classical half of
+    /// a hybrid one. Firefox adds a P-256 share to that pair. These are real
+    /// shares, made from the provider, and a server that picks one of them
+    /// completes the handshake with it. Groups the provider lacks, and groups
+    /// already offered, are skipped. Not repeated after a
+    /// `HelloRetryRequest`, which names the one group to offer.
+    pub extra_key_shares: Vec<NamedGroup>,
+
+    /// Leave out `psk_key_exchange_modes` from a hello that offers no
+    /// pre-shared key.
+    ///
+    /// rustls sends it on every TLS 1.3 hello. Firefox, as uTLS models it,
+    /// sends it only alongside a ticket.
+    pub psk_modes_only_with_psk: bool,
 }
 
 /// When and how far to pad the `ClientHello`.

@@ -8695,6 +8695,119 @@ mod client_hello_shaping {
             }
         }
     }
+
+    /// Firefox's shape: one fixed order, groups rustls cannot do, a P-256
+    /// share on top, extensions rustls does not model, no psk modes.
+    fn firefox_like_profile() -> ClientHelloProfile {
+        ClientHelloProfile {
+            cipher_suites: Some(vec![
+                0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a,
+                0xc009, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+            ]),
+            append_extensions: vec![
+                RawExtension {
+                    typ: 0xff01,
+                    payload: vec![0x00],
+                },
+                RawExtension {
+                    typ: 0x0022,
+                    payload: vec![0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03],
+                },
+                RawExtension::empty(0x0012),
+                RawExtension {
+                    typ: 0x001c,
+                    payload: vec![0x40, 0x01],
+                },
+            ],
+            extension_order: Some(vec![
+                0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0010, 0x0005, 0x0022, 0x0012, 0x0033,
+                0x002b, 0x000d, 0x001c, 0x001b, 0xfe0d,
+            ]),
+            named_groups: Some(vec![
+                NamedGroup::X25519,
+                NamedGroup::secp256r1,
+                NamedGroup::secp384r1,
+                NamedGroup::secp521r1,
+                NamedGroup::FFDHE2048,
+                NamedGroup::FFDHE3072,
+            ]),
+            extra_key_shares: vec![NamedGroup::secp256r1],
+            psk_modes_only_with_psk: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_firefox_shaped_hello_completes_a_handshake() {
+        let provider = provider::default_provider();
+        for kt in KeyType::all_for_provider(&provider) {
+            for version in rustls::ALL_VERSIONS {
+                let mut client_config =
+                    make_client_config_with_versions(*kt, &[version], &provider);
+                client_config.client_hello_profile = Arc::new(firefox_like_profile());
+
+                let (mut client, mut server) =
+                    make_pair_for_configs(client_config, make_server_config(*kt, &provider));
+                do_handshake(&mut client, &mut server);
+                assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+            }
+        }
+    }
+
+    /// A server that wants P-256 takes the extra share, with no retry.
+    #[test]
+    fn a_server_may_pick_the_extra_key_share() {
+        let provider = provider::default_provider();
+        let kt = KeyType::EcdsaP256;
+        let mut client_config =
+            make_client_config_with_versions(kt, &[&rustls::version::TLS13], &provider);
+        client_config.client_hello_profile = Arc::new(firefox_like_profile());
+        let server_config =
+            make_server_config_with_kx_groups(kt, vec![provider::kx_group::SECP256R1], &provider);
+
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+        assert_eq!(
+            client
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
+            Some(NamedGroup::secp256r1)
+        );
+        assert_eq!(
+            server
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
+            Some(NamedGroup::secp256r1)
+        );
+    }
+
+    /// A group with no share sent still costs only the retry it always did.
+    #[test]
+    fn a_server_may_still_ask_for_a_group_without_a_share() {
+        let provider = provider::default_provider();
+        let kt = KeyType::EcdsaP256;
+        let mut client_config =
+            make_client_config_with_versions(kt, &[&rustls::version::TLS13], &provider);
+        client_config.client_hello_profile = Arc::new(firefox_like_profile());
+        let server_config =
+            make_server_config_with_kx_groups(kt, vec![provider::kx_group::SECP384R1], &provider);
+
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(
+            client.handshake_kind(),
+            Some(HandshakeKind::FullWithHelloRetryRequest)
+        );
+        assert_eq!(
+            client
+                .negotiated_key_exchange_group()
+                .map(|group| group.name()),
+            Some(NamedGroup::secp384r1)
+        );
+    }
 }
 
 #[test]

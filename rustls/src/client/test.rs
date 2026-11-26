@@ -1813,3 +1813,191 @@ fn the_retried_hello_keeps_the_shuffled_order() {
     };
     assert_eq!(without_cookie(&first), without_cookie(&second));
 }
+
+/// A profile shaped like Firefox 148 as uTLS models it: no GREASE, no
+/// shuffle, one fixed order, groups rustls cannot do, a third key share,
+/// a fixed-length GREASE ECH and no `psk_key_exchange_modes`.
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+fn firefox_like_config() -> ClientConfig {
+    use crate::client::{ClientHelloProfile, EchGreaseConfig, EchMode};
+    use crate::crypto::hpke::HpkeSuite;
+    use crate::msgs::enums::{HpkeAead, HpkeKdf, HpkeKem};
+    use crate::msgs::handshake::{HpkeSymmetricCipherSuite, RawExtension};
+
+    // Plain groups only, so the shares do not depend on which provider
+    // leads with a hybrid.
+    #[cfg(feature = "ring")]
+    let provider = {
+        use crate::crypto::ring::{default_provider, kx_group};
+        CryptoProvider {
+            kx_groups: vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1],
+            ..default_provider()
+        }
+    };
+    #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+    let provider = {
+        use crate::crypto::aws_lc_rs::{default_provider, kx_group};
+        CryptoProvider {
+            kx_groups: vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1],
+            ..default_provider()
+        }
+    };
+
+    let aes = HpkeSymmetricCipherSuite {
+        kdf_id: HpkeKdf::HKDF_SHA256,
+        aead_id: HpkeAead::AES_128_GCM,
+    };
+    let chacha = HpkeSymmetricCipherSuite {
+        kdf_id: HpkeKdf::HKDF_SHA256,
+        aead_id: HpkeAead::CHACHA20_POLY_1305,
+    };
+    let grease = EchGreaseConfig::without_provider(HpkeSuite {
+        kem: HpkeKem::DHKEM_X25519_HKDF_SHA256,
+        sym: aes,
+    })
+    .unwrap()
+    .with_payload_len(239)
+    .with_alternative_suites(vec![aes, chacha])
+    .unwrap();
+
+    let mut config = ClientConfig::builder_with_provider(provider.into())
+        .with_ech(EchMode::Grease(grease))
+        .unwrap()
+        .with_root_certificates(roots())
+        .with_no_client_auth();
+    config.client_hello_profile = Arc::new(ClientHelloProfile {
+        append_extensions: vec![
+            RawExtension {
+                typ: 0xff01,
+                payload: vec![0x00],
+            },
+            RawExtension::empty(0x0012),
+            RawExtension {
+                typ: 0x001c,
+                payload: vec![0x40, 0x01],
+            },
+        ],
+        extension_order: Some(FIREFOX_ORDER.to_vec()),
+        named_groups: Some(vec![
+            NamedGroup::X25519,
+            NamedGroup::secp256r1,
+            NamedGroup::secp384r1,
+            NamedGroup::secp521r1,
+            NamedGroup::FFDHE2048,
+            NamedGroup::FFDHE3072,
+        ]),
+        extra_key_shares: vec![NamedGroup::secp256r1],
+        psk_modes_only_with_psk: true,
+        ..Default::default()
+    });
+    config
+}
+
+/// Firefox 148's order with the extensions that `firefox_like_config` does
+/// not produce left out (ALPN, delegated credentials, compression).
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+const FIREFOX_ORDER: [u16; 12] = [
+    0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0005, 0x0012, 0x0033, 0x002b, 0x000d, 0x001c, 0xfe0d,
+];
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn a_dictated_extension_order_is_followed_exactly() {
+    // Generated, verbatim and GREASE ECH alike, every hello the same.
+    for _ in 0..20 {
+        let hello = WireClientHello::capture(firefox_like_config());
+        let types = hello.extension_types();
+        let without_ticket: Vec<u16> = types
+            .iter()
+            .copied()
+            .filter(|typ| *typ != 0x0023)
+            .collect();
+        assert_eq!(without_ticket, FIREFOX_ORDER, "{types:04x?}");
+    }
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn unnamed_extensions_follow_the_named_ones() {
+    // session_ticket(35) is not in the order: it goes after everything that
+    // is, and the ones that are keep their places.
+    let hello = WireClientHello::capture(firefox_like_config());
+    let types = hello.extension_types();
+    assert_eq!(&types[..FIREFOX_ORDER.len()], FIREFOX_ORDER, "{types:04x?}");
+    assert_eq!(&types[FIREFOX_ORDER.len()..], &[0x0023], "{types:04x?}");
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn dictated_groups_are_advertised_as_given() {
+    let hello = WireClientHello::capture(firefox_like_config());
+    assert_eq!(
+        hello.named_groups(),
+        vec![0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101]
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn an_extra_key_share_follows_rustls_own() {
+    let hello = WireClientHello::capture(firefox_like_config());
+    let shares = hello.key_shares();
+    let groups: Vec<u16> = shares
+        .iter()
+        .map(|(group, _)| *group)
+        .collect();
+    assert_eq!(groups, vec![0x001d, 0x0017], "{groups:04x?}");
+    // An uncompressed P-256 point, as the provider made it.
+    assert_eq!(shares[1].1.len(), 65);
+    assert_eq!(shares[1].1[0], 0x04);
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn an_extra_key_share_already_offered_is_not_repeated() {
+    let mut config = firefox_like_config();
+    let mut profile = (*config.client_hello_profile).clone();
+    profile.extra_key_shares = vec![NamedGroup::X25519, NamedGroup::secp256r1];
+    config.client_hello_profile = Arc::new(profile);
+
+    let groups: Vec<u16> = WireClientHello::capture(config)
+        .key_shares()
+        .iter()
+        .map(|(group, _)| *group)
+        .collect();
+    assert_eq!(groups, vec![0x001d, 0x0017], "{groups:04x?}");
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn psk_modes_can_be_left_to_hellos_offering_a_psk() {
+    let hello = WireClientHello::capture(firefox_like_config());
+    assert!(hello.extension(0x002d).is_none());
+
+    let mut config = firefox_like_config();
+    let mut profile = (*config.client_hello_profile).clone();
+    profile.psk_modes_only_with_psk = false;
+    config.client_hello_profile = Arc::new(profile);
+    assert!(
+        WireClientHello::capture(config)
+            .extension(0x002d)
+            .is_some()
+    );
+}
+
+#[cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn grease_ech_can_be_one_length_and_either_aead() {
+    let mut aeads = alloc::collections::BTreeSet::new();
+    for _ in 0..64 {
+        let hello = WireClientHello::capture(firefox_like_config());
+        let ech = hello.extension(0xfe0d).unwrap();
+        // outer(1), kdf(2), aead(2), config_id(1), enc(2 + 32), payload(2 + n)
+        assert_eq!(u16::from_be_bytes([ech[1], ech[2]]), 0x0001);
+        aeads.insert(u16::from_be_bytes([ech[3], ech[4]]));
+        assert_eq!(u16::from_be_bytes([ech[6], ech[7]]), 32);
+        assert_eq!(u16::from_be_bytes([ech[40], ech[41]]), 239);
+        assert_eq!(ech.len(), 42 + 239);
+    }
+    assert_eq!(aeads.into_iter().collect::<Vec<_>>(), vec![0x0001, 0x0003]);
+}

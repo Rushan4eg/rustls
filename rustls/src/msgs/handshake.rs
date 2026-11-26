@@ -1060,6 +1060,11 @@ extension_struct! {
         /// a real offer keeps the place rustls gives it. Needs
         /// `shuffle_verbatim`.
         pub(crate) shuffle_ech: bool,
+
+        /// Write every extension in this order, by type, instead of
+        /// shuffling. Types not named go after the named ones; the PSK offer
+        /// stays last.
+        pub(crate) fixed_order: Option<Vec<u16>>,
     }
 }
 
@@ -1104,6 +1109,7 @@ impl ClientExtensions<'_> {
             final_extensions,
             shuffle_verbatim,
             shuffle_ech,
+            fixed_order,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1137,14 +1143,75 @@ impl ClientExtensions<'_> {
             final_extensions,
             shuffle_verbatim,
             shuffle_ech,
+            fixed_order,
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
+        if self.fixed_order.is_some() {
+            let mut exts: Vec<ExtensionType> = self
+                .in_fixed_order()
+                .into_iter()
+                .filter_map(|item| match item {
+                    Shuffled::Generated(ext) => Some(ext),
+                    Shuffled::Verbatim(_) => None,
+                })
+                .collect();
+            exts.extend(self.preshared_key_extension());
+            return exts;
+        }
+
         let mut exts = self.body_extensions_in_encoding_order();
         exts.extend(self.ech_extensions());
         exts.extend(self.preshared_key_extension());
         exts
+    }
+
+    /// Every extension but the PSK offer, placed by `self.fixed_order`.
+    ///
+    /// Gathered in the order they would otherwise be written, then sorted
+    /// stably by their place in the list: types the list does not name keep
+    /// their relative order after the ones it does.
+    fn in_fixed_order(&self) -> Vec<Shuffled<'_>> {
+        let mut items: Vec<Shuffled<'_>> = self
+            .prepended_extensions
+            .iter()
+            .map(Shuffled::Verbatim)
+            .chain(
+                self.body_extensions_in_encoding_order()
+                    .into_iter()
+                    .map(Shuffled::Generated),
+            )
+            .chain(
+                self.appended_extensions
+                    .iter()
+                    .map(Shuffled::Verbatim),
+            )
+            .chain(
+                self.ech_extensions()
+                    .into_iter()
+                    .map(Shuffled::Generated),
+            )
+            .chain(
+                self.final_extensions
+                    .iter()
+                    .map(Shuffled::Verbatim),
+            )
+            .collect();
+
+        if let Some(order) = &self.fixed_order {
+            items.sort_by_key(|item| {
+                let typ = match item {
+                    Shuffled::Generated(ext) => u16::from(*ext),
+                    Shuffled::Verbatim(raw) => raw.typ,
+                };
+                order
+                    .iter()
+                    .position(|named| *named == typ)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        items
     }
 
     /// Extensions rustls generates, in the order they are written.
@@ -1294,6 +1361,18 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
         }
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+        if self.fixed_order.is_some() {
+            for item in self.in_fixed_order() {
+                match item {
+                    Shuffled::Generated(ext) => self.encode_one(ext, body.buf),
+                    Shuffled::Verbatim(raw) => raw.encode(body.buf),
+                }
+            }
+            if let Some(item) = preshared_key {
+                self.encode_one(item, body.buf);
+            }
+            return;
+        }
         for raw in &self.prepended_extensions {
             raw.encode(body.buf);
         }
