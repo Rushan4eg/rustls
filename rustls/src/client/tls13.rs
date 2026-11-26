@@ -108,13 +108,20 @@ pub(super) fn handle_server_hello(
         _ => None,
     };
 
-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
-        .map_err(|_| {
-            cx.common.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                PeerMisbehaved::WrongGroupForKeyShare,
-            )
-        })?;
+    let extra_key_shares = core::mem::take(&mut hello.extra_key_shares);
+    let our_key_share = KeyExchangeChoice::new(
+        &config,
+        cx,
+        our_key_share,
+        extra_key_shares,
+        their_key_share,
+    )
+    .map_err(|_| {
+        cx.common.send_fatal_alert(
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::WrongGroupForKeyShare,
+        )
+    })?;
 
     let key_schedule_pre_handshake = match (server_hello.preshared_key, early_data_key_schedule) {
         (Some(selected_psk), Some(early_key_schedule)) => {
@@ -255,25 +262,36 @@ enum KeyExchangeChoice {
 }
 
 impl KeyExchangeChoice {
-    /// Decide between `our_key_share` or `our_key_share.hybrid_component()`
-    /// based on the selection of the server expressed in `their_key_share`.
+    /// Decide between `our_key_share`, `our_key_share.hybrid_component()`
+    /// or one of the profile's `extra_key_shares` based on the selection of
+    /// the server expressed in `their_key_share`.
     fn new(
         config: &Arc<ClientConfig>,
         cx: &mut ClientContext<'_>,
         our_key_share: Box<dyn ActiveKeyExchange>,
+        extra_key_shares: Vec<Box<dyn ActiveKeyExchange>>,
         their_key_share: &KeyShareEntry,
     ) -> Result<Self, ()> {
         if our_key_share.group() == their_key_share.group {
             return Ok(Self::Whole(our_key_share));
         }
 
-        let (component_group, _) = our_key_share
+        let component_group = our_key_share
             .hybrid_component()
-            .ok_or(())?;
+            .map(|(group, _)| group);
 
-        if component_group != their_key_share.group {
-            return Err(());
+        if component_group != Some(their_key_share.group) {
+            let extra = extra_key_shares
+                .into_iter()
+                .find(|kx| kx.group() == their_key_share.group)
+                .ok_or(())?;
+            let actual_skxg = config
+                .find_kx_group(extra.group(), ProtocolVersion::TLSv1_3)
+                .ok_or(())?;
+            cx.common.kx_state = KxState::Start(actual_skxg);
+            return Ok(Self::Whole(extra));
         }
+        let component_group = their_key_share.group;
 
         // correct the record for the benefit of accuracy of
         // `negotiated_key_exchange_group()`

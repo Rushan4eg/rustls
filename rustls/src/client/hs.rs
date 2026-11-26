@@ -286,16 +286,18 @@ where
     assert!(supported_versions.any(|_| true));
 
     let mut exts = Box::new(ClientExtensions {
-        // offer groups which are usable for any offered version
-        named_groups: Some(
-            config
+        // offer groups which are usable for any offered version, unless the
+        // profile dictates the list
+        named_groups: Some(match &config.client_hello_profile.named_groups {
+            Some(groups) => groups.clone(),
+            None => config
                 .provider
                 .kx_groups
                 .iter()
                 .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
                 .map(|skxg| skxg.name())
                 .collect(),
-        ),
+        }),
         supported_versions: Some(supported_versions),
         // A profile may advertise more than the verifier checks; what is
         // accepted is still the verifier's call.
@@ -402,6 +404,42 @@ where
         exts.key_shares = Some(shares);
     }
 
+    // Shares the profile adds after rustls own, made fresh for the first
+    // hello. A retry that names a group offers that group alone; one that
+    // does not repeats the first hello's shares, these included.
+    match retryreq {
+        None => {
+            input.hello.extra_key_shares.clear();
+            if let Some(shares) = exts.key_shares.as_mut() {
+                for group in &config
+                    .client_hello_profile
+                    .extra_key_shares
+                {
+                    if shares
+                        .iter()
+                        .any(|share| share.group == *group)
+                    {
+                        continue;
+                    }
+                    let Some(skxg) = config.find_kx_group(*group, ProtocolVersion::TLSv1_3) else {
+                        continue;
+                    };
+                    let kx = skxg.start()?;
+                    shares.push(KeyShareEntry::new(kx.group(), kx.pub_key()));
+                    input.hello.extra_key_shares.push(kx);
+                }
+            }
+        }
+        Some(hrr) if hrr.key_share.is_none() => {
+            if let Some(shares) = exts.key_shares.as_mut() {
+                for kx in &input.hello.extra_key_shares {
+                    shares.push(KeyShareEntry::new(kx.group(), kx.pub_key()));
+                }
+            }
+        }
+        Some(_) => input.hello.extra_key_shares.clear(),
+    }
+
     if let Some(cookie) = retryreq.and_then(|hrr| hrr.cookie.as_ref()) {
         exts.cookie = Some(cookie.clone());
     }
@@ -467,6 +505,14 @@ where
 
     // Do we have a SessionID or ticket cached for this host?
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+
+    if config
+        .client_hello_profile
+        .psk_modes_only_with_psk
+        && exts.preshared_key_offer.is_none()
+    {
+        exts.preshared_key_modes = None;
+    }
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
@@ -539,6 +585,7 @@ where
     }
 
     exts.shuffle_verbatim = profile.shuffle_extensions;
+    exts.fixed_order = profile.extension_order.clone();
 
     exts.prepended_extensions.extend(
         profile

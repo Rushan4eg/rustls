@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 
 use super::ResolvesClientCert;
 use super::client_hello_profile::Grease;
+use crate::crypto::ActiveKeyExchange;
 use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
@@ -49,6 +50,11 @@ pub(super) struct ClientHelloDetails {
     /// free.
     pub(super) grease: Option<Grease>,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
+
+    /// Key shares sent on top of the main one, from
+    /// `ClientHelloProfile::extra_key_shares`, kept in case the server picks
+    /// one of them.
+    pub(super) extra_key_shares: Vec<Box<dyn ActiveKeyExchange>>,
 }
 
 impl ClientHelloDetails {
@@ -64,6 +70,7 @@ impl ClientHelloDetails {
             offered_cert_compression: false,
             grease,
             offered_cipher_suites: Vec::new(),
+            extra_key_shares: Vec::new(),
         }
     }
 

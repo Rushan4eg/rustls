@@ -203,6 +203,13 @@ pub struct EchGreaseConfig {
     /// of what GREASE is for. See [`Self::without_provider`].
     pub(crate) hpke: Option<&'static dyn Hpke>,
     pub(crate) placeholder_key: Option<HpkePublicKey>,
+
+    /// The payload length, AEAD tag included, if fixed. `None` sizes it the
+    /// way Chrome does.
+    pub(crate) payload_len: Option<u16>,
+
+    /// Symmetric suites to draw from per hello, in place of `suite.sym`.
+    pub(crate) alternative_sym: Vec<HpkeSymmetricCipherSuite>,
 }
 
 impl EchGreaseConfig {
@@ -220,6 +227,8 @@ impl EchGreaseConfig {
             suite: suite.suite(),
             hpke: Some(suite),
             placeholder_key: Some(placeholder_key),
+            payload_len: None,
+            alternative_sym: Vec::new(),
         }
     }
 
@@ -262,7 +271,43 @@ impl EchGreaseConfig {
             suite,
             hpke: None,
             placeholder_key: None,
+            payload_len: None,
+            alternative_sym: Vec::new(),
         })
+    }
+
+    /// Send a payload of exactly this many bytes, AEAD tag included.
+    ///
+    /// By default the length is drawn the way Chrome draws it, one of four
+    /// sizes. Firefox sends one size every time: 223 bytes and the tag, 239
+    /// with AES-128-GCM.
+    pub fn with_payload_len(mut self, payload_len: u16) -> Self {
+        self.payload_len = Some(payload_len);
+        self
+    }
+
+    /// Pick the symmetric suite for each hello at random from these, instead
+    /// of always using the configured one.
+    ///
+    /// Firefox, as uTLS models it, GREASEs with AES-128-GCM or
+    /// ChaCha20-Poly1305 at random. Only takes effect without an HPKE
+    /// provider ([`Self::without_provider`]): a provider is bound to one
+    /// suite. Suites whose AEAD has no known tag length are refused.
+    pub fn with_alternative_suites(
+        mut self,
+        suites: Vec<HpkeSymmetricCipherSuite>,
+    ) -> Result<Self, Error> {
+        if let Some(bad) = suites
+            .iter()
+            .find(|sym| sym.aead_id.tag_len().is_none())
+        {
+            return Err(Error::General(format!(
+                "unknown tag length for {:?}",
+                bad.aead_id
+            )));
+        }
+        self.alternative_sym = suites;
+        Ok(self)
     }
 
     /// Build a GREASE ECH extension based on the placeholder configuration.
@@ -283,7 +328,12 @@ impl EchGreaseConfig {
         let mut config_id: [u8; 1] = [0; 1];
         secure_random.fill(&mut config_id[..])?;
 
-        let suite = self.suite;
+        let mut suite = self.suite;
+        if self.hpke.is_none() && !self.alternative_sym.is_empty() {
+            let mut pick = [0u8; 1];
+            secure_random.fill(&mut pick)?;
+            suite.sym = self.alternative_sym[usize::from(pick[0]) % self.alternative_sym.len()];
+        }
 
         // The KEM the configured suite actually uses, not a fixed one: it
         // decides the length of `enc` below, and that length is visible on the
@@ -363,16 +413,23 @@ impl EchGreaseConfig {
         // AES-128-GCM. Sizing it by the inner hello made ours a constant 400:
         // the same length on every connection and far outside what Chrome
         // sends, which marks the hello as not Chrome's.
-        let mut pick = [0u8; 1];
-        secure_random.fill(&mut pick)?;
-        let payload_len = 32 * (4 + usize::from(pick[0] % 4))
-            + suite
-                .sym
-                .aead_id
-                .tag_len()
-                // Safety: we have confirmed the AEAD is supported when building the config. All
-                //  supported AEADs have a tag length.
-                .unwrap();
+        //
+        // Unless a length is fixed: Firefox sends one length every time.
+        let payload_len = match self.payload_len {
+            Some(len) => usize::from(len),
+            None => {
+                let mut pick = [0u8; 1];
+                secure_random.fill(&mut pick)?;
+                32 * (4 + usize::from(pick[0] % 4))
+                    + suite
+                        .sym
+                        .aead_id
+                        .tag_len()
+                        // Safety: we have confirmed the AEAD is supported when building the
+                        //  config. All supported AEADs have a tag length.
+                        .unwrap()
+            }
+        };
         let mut payload = vec![0; payload_len];
         secure_random.fill(&mut payload)?;
 
